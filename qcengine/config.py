@@ -166,6 +166,7 @@ class TaskConfig(pydantic.BaseSettings):
     scratch_messy: bool = pydantic.Field(
         False, description="Leave scratch directory and contents on disk after completion."
     )
+    device: str = pydantic.Field(None, description="Device to run the computation on")
 
     class Config(pydantic.BaseSettings.Config):
         extra = "forbid"

@@ -5,9 +5,17 @@ from qcengine.exceptions import InputError
 from qcengine.programs.model import ProgramHarness
 from qcengine.units import ureg
 
+import mace
+import numpy as np
+import torch
+from mace.data import AtomicData
+from mace.data.utils import AtomicNumberTable, Configuration
+from mace.tools.torch_geometric import DataLoader
+
 if TYPE_CHECKING:
     from qcelemental.models import AtomicInput, FailedOperation
     from qcengine.config import TaskConfig
+import logging
 
 
 class MACEHarness(ProgramHarness):
@@ -47,7 +55,7 @@ class MACEHarness(ProgramHarness):
 
         return self.version_cache[which_prog]
 
-    def load_model(self, name: str):
+    def load_model(self, name: str, device: torch.device):
         """Compile and cache the model to make it faster when calling many times in serial"""
         model_name = name.lower()
         if model_name in self._CACHE:
@@ -62,11 +70,12 @@ class MACEHarness(ProgramHarness):
             model = mace_off(model=model_name, return_raw_model=True)
         else:
             try:
-                model = torch.load(name, map_location=torch.device("cpu"))
+                model = torch.load(name, map_location=device)
             except FileNotFoundError:
                 raise InputError(
                     "The mace harness can only run local models or a MACE-OFF23 model (`small`, `medium`, `large`)"
                 )
+        model = model.to(device)
         comp_mod = jit.compile(model)
         self._CACHE[model_name] = (comp_mod, float(model.r_max), model.atomic_numbers)
         return self._CACHE[model_name]
@@ -75,16 +84,11 @@ class MACEHarness(ProgramHarness):
 
         self.found(raise_error=True)
 
-        import mace
-        import numpy as np
-        import torch
-        from mace.data import AtomicData
-        from mace.data.utils import AtomicNumberTable, Configuration
-        from mace.tools.torch_geometric import DataLoader
-
         torch.set_default_dtype(torch.float64)
-
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if config.device is None:
+            device = torch.device("cpu")
+        else:
+            device = config.device
         # Failure flag
         ret_data = {"success": False}
 
@@ -92,7 +96,7 @@ class MACEHarness(ProgramHarness):
         method = input_data.model.method
 
         # load the torch model which can be a MACE-OFF23 or local model
-        model, r_max, atomic_numbers = self.load_model(name=method)
+        model, r_max, atomic_numbers = self.load_model(name=method, device=device)
 
         z_table = AtomicNumberTable([int(z) for z in atomic_numbers])
         atomic_numbers = input_data.molecule.atomic_numbers
@@ -113,16 +117,15 @@ class MACEHarness(ProgramHarness):
             shuffle=False,
             drop_last=False,
         )
-        input_dict = next(iter(data_loader)).to_dict()
-        model.to(device)
+        input_dict = next(iter(data_loader)).to(device).to_dict()
         mace_data = model(input_dict, compute_force=True)
-        ret_data["properties"] = {"return_energy": mace_data["energy"] * ureg.conversion_factor("eV", "hartree")}
+        ret_data["properties"] = {"return_energy": mace_data["energy"].cpu() * ureg.conversion_factor("eV", "hartree")}
 
         if input_data.driver == "energy":
             ret_data["return_result"] = ret_data["properties"]["return_energy"]
         elif input_data.driver == "gradient":
             ret_data["return_result"] = (
-                np.asarray(-1.0 * mace_data["forces"] * ureg.conversion_factor("eV / angstrom", "hartree / bohr"))
+                np.asarray(-1.0 * mace_data["forces"].cpu() * ureg.conversion_factor("eV / angstrom", "hartree / bohr"))
                 .ravel()
                 .tolist()
             )
